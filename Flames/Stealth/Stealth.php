@@ -35,12 +35,15 @@ final class Stealth
 
     private readonly Endpoint $endpoint;
 
+    private readonly ?CursorSync $cursorSync;
+
     private int $timeout;
 
     public function __construct(?string $host = null, ?int $port = null, ?int $timeout = null)
     {
         $this->timeout = $timeout ?? Endpoint::resolveDefaultTimeout();
         $this->endpoint = Endpoint::fromEnv($host, $port);
+        $this->cursorSync = CursorSync::enabled() ? new CursorSync() : null;
     }
 
     public function setTimeout(int $seconds): void
@@ -67,6 +70,10 @@ final class Stealth
         $this->client = AsyncClient::connect((string) $target['webSocketDebuggerUrl']);
         $this->targetId = $target['id'] ?? null;
         $this->bootstrapDomains();
+
+        if ($this->targetId !== null) {
+            $this->cursorSync?->register($this->targetId, $this->mouseX, $this->mouseY);
+        }
     }
 
     /**
@@ -222,10 +229,12 @@ final class Stealth
 
     public function moveMouseTo(float $x, float $y): void
     {
+        $this->bringToFront();
         $nextPauseAt = random_int(4, 9);
 
         foreach (HumanMouse::path($this->mouseX, $this->mouseY, $x, $y) as $step => [$px, $py]) {
             $this->dispatchMouseMove($px, $py);
+            $this->syncCursor($px, $py);
 
             if ($step === $nextPauseAt) {
                 asleep(random_int(1, 5) / 1000.0);
@@ -236,6 +245,7 @@ final class Stealth
         $this->cdpFlush();
         $this->mouseX = $x;
         $this->mouseY = $y;
+        $this->syncCursor($x, $y);
     }
 
     /** @return array{0: float, 1: float} */
@@ -344,6 +354,10 @@ final class Stealth
             }
         } catch (StealthException) {
         } finally {
+            if ($this->targetId !== null) {
+                $this->cursorSync?->unregister($this->targetId);
+            }
+
             $this->client->close();
             $this->client = null;
             $this->targetId = null;
@@ -368,6 +382,11 @@ final class Stealth
     /** @var array{dom: bool, load: bool} */
     private array $pageLoadState = ['dom' => false, 'load' => false];
 
+    private bool $pageCursorReady = false;
+
+    /** @var array{x: float, y: float}|null */
+    private ?array $viewportChromeOffset = null;
+
     private function bootstrapDomains(): void
     {
         $this->cdp('Page.enable');
@@ -381,6 +400,74 @@ final class Stealth
         if ($this->client === null) {
             throw new StealthException('Stealth is not launched. Call launch() first.');
         }
+    }
+
+    private function bringToFront(): void
+    {
+        $this->cdp('Page.bringToFront');
+
+        if ($this->targetId !== null) {
+            $this->cursorSync?->focus($this->targetId);
+        }
+    }
+
+    private function syncCursor(float $x, float $y, bool $paintDom = true): void
+    {
+        if ($paintDom) {
+            $this->ensurePageCursor();
+
+            try {
+                $this->evaluate(PageCursor::move($x, $y));
+            } catch (StealthException) {
+            }
+        }
+
+        if ($this->targetId === null) {
+            return;
+        }
+
+        $offset = $this->viewportChromeOffset();
+        $this->cursorSync?->move(
+            $this->targetId,
+            $x + $offset['x'],
+            $y + $offset['y'],
+        );
+    }
+
+    private function resetPageCursor(): void
+    {
+        $this->pageCursorReady = false;
+        $this->viewportChromeOffset = null;
+    }
+
+    private function ensurePageCursor(): void
+    {
+        if ($this->pageCursorReady) {
+            return;
+        }
+
+        $this->ensureRuntimeEnabled();
+        $this->evaluate(PageCursor::bootstrap());
+        $this->pageCursorReady = true;
+    }
+
+    /** @return array{x: float, y: float} */
+    private function viewportChromeOffset(): array
+    {
+        if ($this->viewportChromeOffset !== null) {
+            return $this->viewportChromeOffset;
+        }
+
+        $this->ensureRuntimeEnabled();
+
+        $result = $this->evaluate('({x:(window.outerWidth-window.innerWidth)/2,y:window.outerHeight-window.innerHeight})');
+
+        $this->viewportChromeOffset = [
+            'x' => (float) (is_array($result) ? ($result['x'] ?? 0) : 0),
+            'y' => (float) (is_array($result) ? ($result['y'] ?? 0) : 0),
+        ];
+
+        return $this->viewportChromeOffset;
     }
 
     private function armPageLoadWait(): void
@@ -405,6 +492,9 @@ final class Stealth
             $this->client->pump();
 
             if ($this->pageLoadState['load']) {
+                $this->resetPageCursor();
+                $this->ensurePageCursor();
+
                 return;
             }
 
@@ -412,6 +502,9 @@ final class Stealth
         }
 
         if ($this->pageLoadState['dom']) {
+            $this->resetPageCursor();
+            $this->ensurePageCursor();
+
             return;
         }
 
