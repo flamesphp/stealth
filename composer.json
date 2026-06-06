@@ -1,0 +1,12 @@
+{
+  "name": "flamesphp/stealth",
+  "description": "Flames: Stealth Browser (CDP)",
+  "type": "library",
+  "license": "MIT",
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "require": {
+    "php": ">=8.5",
+    "flamesphp/docker": "^1.0"
+  }
+}
