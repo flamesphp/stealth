@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 
+
 namespace Flames\Stealth\Cdp;
 
 use Flames\Docker\Docker;
@@ -12,6 +13,12 @@ use Flames\Stealth\Exception\StealthException;
  */
 final class Endpoint
 {
+    private const HTTP_TIMEOUT = 2;
+
+    private const MAX_ATTEMPTS = 3;
+
+    private const RETRY_DELAY = 0.2;
+
     public function __construct(
         private readonly string $host,
         private readonly int $port,
@@ -35,27 +42,91 @@ final class Endpoint
         return "http://{$this->host}:{$this->port}";
     }
 
-    /**
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> */
     public function version(): array
     {
         return $this->request('GET', '/json/version');
     }
 
     /**
+     * Reuses an existing tab from /json/list (tab-guard keeps one open).
+     * Never calls /json/new — it breaks through socat.
+     *
      * @return array<string, mixed>
      */
-    public function createTarget(string $url = 'about:blank'): array
-    {
-        $encoded = rawurlencode($url);
-        $result  = $this->request('PUT', "/json/new?{$encoded}");
+    public function acquireTargetWithRetry(
+        string $url = 'about:blank',
+        ?int $maxAttempts = null,
+        ?float $delaySeconds = null,
+    ): array {
+        $maxAttempts ??= self::MAX_ATTEMPTS;
+        $delaySeconds ??= self::RETRY_DELAY;
+        $lastError = null;
 
-        if (!is_array($result) || empty($result['webSocketDebuggerUrl'])) {
-            throw new StealthException('Failed to create a new browser target.');
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            try {
+                return $this->acquireTarget();
+            } catch (StealthException $e) {
+                $lastError = $e;
+                if ($attempt < $maxAttempts) {
+                    asleep($delaySeconds);
+                }
+            }
         }
 
-        return $result;
+        throw new StealthException(
+            "Stealth unavailable after {$maxAttempts} attempts ({$this->baseUrl()}): "
+            . $lastError?->getMessage(),
+            previous: $lastError,
+        );
+    }
+
+    /** @return array<string, mixed> */
+    public function acquireTarget(): array
+    {
+        $this->version();
+
+        foreach ($this->getTabs() as $tab) {
+            if (!empty($tab['webSocketDebuggerUrl'])) {
+                return $tab;
+            }
+        }
+
+        throw new StealthException(
+            'No CDP targets in /json/list. Check stealth container and tab-guard.',
+        );
+    }
+
+    public function rewriteWebSocketUrl(string $url): string
+    {
+        $parts = parse_url($url);
+
+        if (!is_array($parts)) {
+            return $url;
+        }
+
+        $scheme = $parts['scheme'] ?? 'ws';
+        $path = ($parts['path'] ?? '/')
+            . (isset($parts['query']) ? '?' . $parts['query'] : '');
+
+        return "{$scheme}://{$this->host}:{$this->port}{$path}";
+    }
+
+    /** @return list<array<string, mixed>> */
+    public function getTabs(): array
+    {
+        $result = $this->requestList('GET', '/json/list');
+        $tabs = [];
+
+        foreach ($result as $tab) {
+            if (!is_array($tab)) {
+                continue;
+            }
+
+            $tabs[] = $this->normalizeTarget($tab);
+        }
+
+        return $tabs;
     }
 
     public function closeTarget(string $targetId): void
@@ -63,25 +134,76 @@ final class Endpoint
         $this->request('GET', '/json/close/' . rawurlencode($targetId));
     }
 
-    /**
-     * @return array<string, mixed>
-     */
+    /** @param array<string, mixed> $target */
+    private function normalizeTarget(array $target): array
+    {
+        if (!empty($target['webSocketDebuggerUrl'])) {
+            $target['webSocketDebuggerUrl'] = $this->rewriteWebSocketUrl((string) $target['webSocketDebuggerUrl']);
+        }
+
+        return $target;
+    }
+
+    /** @return list<mixed> */
+    private function requestList(string $method, string $path): array
+    {
+        $decoded = $this->requestRaw($method, $path);
+
+        if (!is_array($decoded) || !array_is_list($decoded)) {
+            throw new StealthException("Expected JSON list from {$method} {$this->baseUrl()}{$path}");
+        }
+
+        return $decoded;
+    }
+
+    /** @return array<string, mixed> */
     private function request(string $method, string $path): array
     {
-        $url = $this->baseUrl() . $path;
+        $decoded = $this->requestRaw($method, $path);
 
+        if (!is_array($decoded) || array_is_list($decoded)) {
+            throw new StealthException("Expected JSON object from {$method} {$this->baseUrl()}{$path}");
+        }
+
+        return $decoded;
+    }
+
+    /** @return array<mixed> */
+    private function requestRaw(string $method, string $path): array
+    {
+        $url = $this->baseUrl() . $path;
+        $lastError = null;
+
+        foreach (self::cdpHostHeaders($this->port) as $hostHeader) {
+            try {
+                return $this->doRequest($method, $path, $url, $hostHeader);
+            } catch (StealthException $e) {
+                $lastError = $e;
+                if (!self::isHostHeaderError($e)) {
+                    throw $e;
+                }
+            }
+        }
+
+        throw $lastError ?? new StealthException("CDP HTTP failed ({$method} {$url})");
+    }
+
+    /** @return array<mixed> */
+    private function doRequest(string $method, string $path, string $url, string $hostHeader): array
+    {
         $context = stream_context_create([
             'http' => [
                 'method'        => $method,
-                'timeout'       => 15,
+                'timeout'       => self::HTTP_TIMEOUT,
                 'ignore_errors' => true,
-                'header'        => "Connection: close\r\n",
+                'header'        => "Host: {$hostHeader}\r\nConnection: close\r\n",
             ],
         ]);
 
         $body = @file_get_contents($url, false, $context);
+
         if ($body === false) {
-            throw new StealthException("CDP HTTP request failed: {$method} {$url}");
+            throw new StealthException("CDP HTTP failed ({$method} {$url})");
         }
 
         if (str_starts_with($path, '/json/close/')) {
@@ -89,10 +211,23 @@ final class Endpoint
         }
 
         $decoded = json_decode($body, true);
+
         if (!is_array($decoded)) {
-            throw new StealthException("Invalid CDP HTTP response: {$method} {$url}");
+            $preview = substr(trim($body), 0, 120);
+            throw new StealthException("Invalid CDP response ({$method} {$url}): {$preview}");
         }
 
         return $decoded;
+    }
+
+    /** @return list<string> */
+    public static function cdpHostHeaders(int $port): array
+    {
+        return ["127.0.0.1:{$port}", "localhost:{$port}"];
+    }
+
+    private static function isHostHeaderError(StealthException $e): bool
+    {
+        return str_contains($e->getMessage(), 'Host header');
     }
 }

@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 
+
 namespace Flames\Stealth\Cdp;
 
 use Flames\Stealth\Exception\StealthException;
@@ -12,38 +13,131 @@ final class WebSocket
 {
     private mixed $socket = null;
 
+    private string $readBuffer = '';
+
     public function __construct(
         private readonly string $url,
         private readonly float $timeout = 30.0,
+        private readonly ?string $hostHeader = null,
     ) {}
 
-    public function connect(): void
+    public static function connect(string $url, float $timeout = 5.0): self
+    {
+        $parts = parse_url($url);
+        $port = (int) ($parts['port'] ?? 9222);
+        $lastError = null;
+
+        foreach (Endpoint::cdpHostHeaders($port) as $hostHeader) {
+            try {
+                $socket = new self($url, $timeout, $hostHeader);
+                $socket->doConnect();
+
+                return $socket;
+            } catch (StealthException $e) {
+                $lastError = $e;
+            }
+        }
+
+        throw $lastError ?? new StealthException('WebSocket connection failed.');
+    }
+
+    private function doConnect(): void
+    {
+        $parts = $this->parseUrl();
+        $this->socket = $this->openSocket($parts);
+        $this->performHandshake($parts);
+    }
+
+    public function send(string $payload): void
+    {
+        if (!is_resource($this->socket)) {
+            throw new StealthException('WebSocket is not connected.');
+        }
+
+        if (fwrite($this->socket, $this->buildFrame($payload)) === false) {
+            throw new StealthException('WebSocket send failed.');
+        }
+    }
+
+    public function readFrameNonBlocking(): ?string
+    {
+        $frame = $this->decodeFrameFromBuffer($this->readBuffer);
+
+        if ($frame !== null) {
+            return $frame;
+        }
+
+        $read = [$this->socket];
+        $write = $except = null;
+
+        if (@stream_select($read, $write, $except, 0, 0) > 0) {
+            $chunk = @fread($this->socket, 65_536);
+            if ($chunk !== false && $chunk !== '') {
+                $this->readBuffer .= $chunk;
+            }
+        }
+
+        return $this->decodeFrameFromBuffer($this->readBuffer);
+    }
+
+    public function receive(int $timeoutSeconds): ?string
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
+
+        while (microtime(true) < $deadline) {
+            $frame = $this->decodeFrameFromBuffer($this->readBuffer);
+
+            if ($frame !== null) {
+                return $frame;
+            }
+
+            $remaining = min($deadline - microtime(true), 0.1);
+
+            if ($remaining <= 0.0) {
+                break;
+            }
+
+            $this->fillBuffer($remaining);
+        }
+
+        return null;
+    }
+
+    public function close(): void
+    {
+        if (is_resource($this->socket)) {
+            @fclose($this->socket);
+        }
+
+        $this->socket = null;
+        $this->readBuffer = '';
+    }
+
+    private function parseUrl(): array
     {
         $parts = parse_url($this->url);
+
         if (!is_array($parts) || empty($parts['host'])) {
             throw new StealthException("Invalid WebSocket URL: {$this->url}");
         }
 
-        $scheme = $parts['scheme'] ?? 'ws';
-        $host   = $parts['host'];
-        $port   = $parts['port'] ?? ($scheme === 'wss' ? 443 : 80);
-        $path   = ($parts['path'] ?? '/') . ($parts['query'] ?? '' ? '?' . $parts['query'] : '');
+        return $parts;
+    }
 
+    private function openSocket(array $parts): mixed
+    {
+        $scheme = $parts['scheme'] ?? 'ws';
+        $host = $parts['host'];
+        $port = $parts['port'] ?? ($scheme === 'wss' ? 443 : 80);
         $transport = $scheme === 'wss' ? 'ssl' : 'tcp';
-        $target    = "{$transport}://{$host}:{$port}";
 
         $socket = @stream_socket_client(
-            $target,
+            "{$transport}://{$host}:{$port}",
             $errno,
             $errstr,
             $this->timeout,
             STREAM_CLIENT_CONNECT,
-            stream_context_create([
-                'ssl' => [
-                    'verify_peer'      => false,
-                    'verify_peer_name' => false,
-                ],
-            ]),
+            stream_context_create(['ssl' => ['verify_peer' => false, 'verify_peer_name' => false]]),
         );
 
         if ($socket === false) {
@@ -52,8 +146,15 @@ final class WebSocket
 
         stream_set_timeout($socket, (int) ceil($this->timeout));
 
-        $key  = base64_encode(random_bytes(16));
-        $hostHeader = $host . (($scheme === 'wss' && $port !== 443) || ($scheme === 'ws' && $port !== 80) ? ':' . $port : '');
+        return $socket;
+    }
+
+    private function performHandshake(array $parts): void
+    {
+        $port = $parts['port'] ?? (($parts['scheme'] ?? 'ws') === 'wss' ? 443 : 80);
+        $path = ($parts['path'] ?? '/') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+        $hostHeader = $this->hostHeader ?? "127.0.0.1:{$port}";
+        $key = base64_encode(random_bytes(16));
 
         $request = implode("\r\n", [
             "GET {$path} HTTP/1.1",
@@ -66,122 +167,85 @@ final class WebSocket
             '',
         ]);
 
-        if (fwrite($socket, $request) === false) {
+        if (fwrite($this->socket, $request) === false) {
             throw new StealthException('WebSocket handshake write failed.');
         }
 
-        $response = stream_get_contents($socket, 8192);
-        if (!is_string($response) || !str_contains($response, '101')) {
+        $response = '';
+        while (true) {
+            $line = fgets($this->socket, 4_096);
+            if ($line === false || $line === "\r\n") {
+                break;
+            }
+            $response .= $line;
+        }
+
+        if (!str_contains($response, '101')) {
             throw new StealthException('WebSocket handshake failed.');
         }
-
-        $this->socket = $socket;
     }
 
-    public function send(string $payload): void
+    private function buildFrame(string $payload): string
     {
-        if (!is_resource($this->socket)) {
-            throw new StealthException('WebSocket is not connected.');
-        }
-
         $length = strlen($payload);
-        $frame  = chr(0x81);
+        $frame = chr(0x81);
 
         if ($length <= 125) {
             $frame .= chr(0x80 | $length);
-        } elseif ($length <= 65535) {
+        } elseif ($length <= 65_535) {
             $frame .= chr(0x80 | 126) . pack('n', $length);
         } else {
             $frame .= chr(0x80 | 127) . pack('J', $length);
         }
 
         $mask = random_bytes(4);
-        $frame .= $mask;
+        $repeated = str_repeat($mask, (int) ceil($length / 4));
 
-        for ($i = 0; $i < $length; $i++) {
-            $frame .= $payload[$i] ^ $mask[$i % 4];
-        }
-
-        if (fwrite($this->socket, $frame) === false) {
-            throw new StealthException('WebSocket send failed.');
-        }
+        return $frame . $mask . substr($payload ^ $repeated, 0, $length);
     }
 
-    public function receive(int $timeoutSeconds): ?string
+    private function fillBuffer(float $seconds): void
     {
-        if (!is_resource($this->socket)) {
-            throw new StealthException('WebSocket is not connected.');
-        }
+        $tvSec = (int) $seconds;
+        $tvUsec = (int) (($seconds - $tvSec) * 1_000_000);
+        $read = [$this->socket];
+        $write = $except = null;
 
-        stream_set_timeout($this->socket, max(1, $timeoutSeconds));
-
-        $data = '';
-        $deadline = microtime(true) + $timeoutSeconds;
-
-        while (microtime(true) < $deadline) {
-            $chunk = fread($this->socket, 8192);
-            if ($chunk === false) {
-                throw new StealthException('WebSocket read failed.');
-            }
-
-            if ($chunk === '') {
-                $meta = stream_get_meta_data($this->socket);
-                if (($meta['timed_out'] ?? false) === true) {
-                    return null;
-                }
-                usleep(10_000);
-                continue;
-            }
-
-            $data .= $chunk;
-            $decoded = $this->decodeFrame($data);
-            if ($decoded !== null) {
-                return $decoded;
+        if (@stream_select($read, $write, $except, $tvSec, $tvUsec) > 0) {
+            $chunk = @fread($this->socket, 65_536);
+            if ($chunk !== false && $chunk !== '') {
+                $this->readBuffer .= $chunk;
             }
         }
-
-        return null;
     }
 
-    public function close(): void
-    {
-        if (is_resource($this->socket)) {
-            @fclose($this->socket);
-        }
-        $this->socket = null;
-    }
-
-    private function decodeFrame(string $buffer): ?string
+    private function decodeFrameFromBuffer(string &$buffer): ?string
     {
         $length = strlen($buffer);
+
         if ($length < 2) {
             return null;
         }
 
         $secondByte = ord($buffer[1]);
-        $masked     = ($secondByte & 0x80) !== 0;
+        $masked = ($secondByte & 0x80) !== 0;
         $payloadLen = $secondByte & 0x7F;
-        $offset     = 2;
+        $offset = 2;
 
         if ($payloadLen === 126) {
-            if ($length < 4) {
-                return null;
-            }
+            if ($length < 4) return null;
             $payloadLen = unpack('n', substr($buffer, 2, 2))[1];
-            $offset     = 4;
+            $offset = 4;
         } elseif ($payloadLen === 127) {
-            if ($length < 10) {
-                return null;
-            }
+            if ($length < 10) return null;
             $payloadLen = unpack('J', substr($buffer, 2, 8))[1];
-            $offset     = 10;
+            $offset = 10;
         }
 
+        $mask = '';
         if ($masked) {
-            if ($length < $offset + 4) {
-                return null;
-            }
-            $mask   = substr($buffer, $offset, 4);
+            if ($length < $offset + 4) return null;
+            $mask = substr($buffer, $offset, 4);
             $offset += 4;
         }
 
@@ -192,12 +256,11 @@ final class WebSocket
         $payload = substr($buffer, $offset, $payloadLen);
 
         if ($masked) {
-            $unmasked = '';
-            for ($i = 0; $i < $payloadLen; $i++) {
-                $unmasked .= $payload[$i] ^ $mask[$i % 4];
-            }
-            return $unmasked;
+            $repeated = str_repeat($mask, (int) ceil($payloadLen / 4));
+            $payload = substr($payload ^ $repeated, 0, $payloadLen);
         }
+
+        $buffer = substr($buffer, $offset + $payloadLen);
 
         return $payload;
     }

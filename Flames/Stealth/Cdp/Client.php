@@ -18,8 +18,7 @@ final class Client
 
     public static function connect(string $webSocketUrl, float $timeout = 30.0): self
     {
-        $socket = new WebSocket($webSocketUrl, $timeout);
-        $socket->connect();
+        $socket = WebSocket::connect($webSocketUrl, $timeout);
 
         return new self($socket);
     }
