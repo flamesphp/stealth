@@ -21,7 +21,7 @@ final class WebSocket
         private readonly ?string $hostHeader = null,
     ) {}
 
-    public static function connect(string $url, float $timeout = 5.0): self
+    public static function connect(string $url, float $timeout = 1.0): self
     {
         $parts = parse_url($url);
         $port = (int) ($parts['port'] ?? 9222);
@@ -144,7 +144,8 @@ final class WebSocket
             throw new StealthException("WebSocket connection failed ({$errno}): {$errstr}");
         }
 
-        stream_set_timeout($socket, (int) ceil($this->timeout));
+        $seconds = max(1, (int) ceil($this->timeout));
+        stream_set_timeout($socket, $seconds);
 
         return $socket;
     }
@@ -174,9 +175,19 @@ final class WebSocket
         $response = '';
         while (true) {
             $line = fgets($this->socket, 4_096);
-            if ($line === false || $line === "\r\n") {
+
+            if ($line === false) {
+                $meta = stream_get_meta_data($this->socket);
+                if (($meta['timed_out'] ?? false) === true) {
+                    throw new StealthException('WebSocket handshake timed out.');
+                }
                 break;
             }
+
+            if ($line === "\r\n") {
+                break;
+            }
+
             $response .= $line;
         }
 

@@ -4,12 +4,10 @@ declare(strict_types=1);
 
 namespace Flames\Stealth\Cdp;
 
-use Flames\Async\Container;
 use Flames\Stealth\Exception\StealthException;
 
 /**
- * CDP client using only global async()/await()/asleep().
- * Responses are matched by ID — no manual Promise instances.
+ * CDP client — synchronous send() with inline WebSocket pump.
  *
  * @internal
  */
@@ -31,43 +29,71 @@ final class AsyncClient
         );
     }
 
-    public static function connect(string $webSocketUrl, float $timeout = 5.0): self
+    public static function connect(string $webSocketUrl, float $timeout = 1.0): self
     {
         return new self(WebSocket::connect($webSocketUrl, $timeout));
     }
 
-    /** @param array<string, mixed> $params */
-    public function send(string $method, array $params = [], int $timeoutSeconds = 8): Container
+    public function once(string $method, callable $handler): void
     {
-        return async(function () use ($method, $params, $timeoutSeconds) {
-            $id = ++$this->messageId;
-            $this->pending[$id] = ['done' => false];
-            $this->socket->send($this->encode($id, $method, $params));
+        $this->bus->once($method, $handler);
+    }
 
-            $deadline = microtime(true) + $timeoutSeconds;
+    public function pump(): void
+    {
+        $this->bus->pump();
+    }
 
-            while ($this->pending[$id]['done'] === false) {
-                if (microtime(true) > $deadline) {
-                    unset($this->pending[$id]);
-                    throw new StealthException("Timeout waiting for CDP method '{$method}'.");
-                }
+    /** @param array<string, mixed> $params */
+    public function push(string $method, array $params = []): void
+    {
+        $id = ++$this->messageId;
+        $this->socket->send($this->encode($id, $method, $params));
+    }
 
-                $this->bus->pump();
+    public function flush(float $timeoutSeconds = 2.0): void
+    {
+        $deadline = microtime(true) + $timeoutSeconds;
 
-                if ($this->pending[$id]['done'] === false) {
-                    asleep(0.001);
-                }
+        while (microtime(true) < $deadline) {
+            $this->bus->pump();
+            asleep(0.001);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    public function send(string $method, array $params = [], int $timeoutSeconds = 8): array
+    {
+        $id = ++$this->messageId;
+        $this->pending[$id] = ['done' => false];
+        $this->socket->send($this->encode($id, $method, $params));
+
+        $deadline = microtime(true) + $timeoutSeconds;
+
+        while ($this->pending[$id]['done'] === false) {
+            if (microtime(true) > $deadline) {
+                unset($this->pending[$id]);
+                throw new StealthException("Timeout waiting for CDP method '{$method}'.");
             }
 
-            $slot = $this->pending[$id];
-            unset($this->pending[$id]);
+            $this->bus->pump();
 
-            if (isset($slot['error'])) {
-                throw new StealthException($slot['error']);
+            if ($this->pending[$id]['done'] === false) {
+                asleep(0.001);
             }
+        }
 
-            return $slot['result'] ?? [];
-        });
+        $slot = $this->pending[$id];
+        unset($this->pending[$id]);
+
+        if (isset($slot['error'])) {
+            throw new StealthException($slot['error']);
+        }
+
+        return $slot['result'] ?? [];
     }
 
     public function close(): void
