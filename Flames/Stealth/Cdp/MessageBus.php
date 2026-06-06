@@ -25,11 +25,16 @@ final class MessageBus
         $this->eventListeners[$method][] = ['once' => true, 'handler' => $handler];
     }
 
-    public function pump(): void
+    public function pump(): bool
     {
+        $processed = false;
+
         while (($frame = $this->socket->readFrameNonBlocking()) !== null) {
             $this->dispatch($frame);
+            $processed = true;
         }
+
+        return $processed;
     }
 
     private function dispatch(string $json): void

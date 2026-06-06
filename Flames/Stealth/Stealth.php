@@ -29,6 +29,11 @@ final class Stealth
 {
     private bool $closed = false;
 
+    private ?string $userAgent = null;
+
+    /** @var array<string, true> */
+    private array $fingerprintAppliedTabIds = [];
+
     private ?string $targetId = null;
 
     private ?AsyncClient $client = null;
@@ -73,6 +78,7 @@ final class Stealth
 
         if ($this->targetId !== null) {
             $this->cursorSync?->register($this->targetId, $this->mouseX, $this->mouseY);
+            $this->cursorSync?->focus($this->targetId);
         }
     }
 
@@ -232,7 +238,10 @@ final class Stealth
         $this->bringToFront();
         $nextPauseAt = random_int(4, 9);
 
-        foreach (HumanMouse::path($this->mouseX, $this->mouseY, $x, $y) as $step => [$px, $py]) {
+        $path = HumanMouse::path($this->mouseX, $this->mouseY, $x, $y);
+        $lastStep = count($path) - 1;
+
+        foreach ($path as $step => [$px, $py]) {
             $this->dispatchMouseMove($px, $py);
             $this->syncCursor($px, $py);
 
@@ -275,6 +284,8 @@ final class Stealth
 
     private function dispatchMouseClick(float $x, float $y): void
     {
+        $this->animateClick($x, $y);
+
         $this->cdp('Input.dispatchMouseEvent', [
             'type'       => 'mousePressed',
             'x'          => $x,
@@ -382,17 +393,109 @@ final class Stealth
     /** @var array{dom: bool, load: bool} */
     private array $pageLoadState = ['dom' => false, 'load' => false];
 
-    private bool $pageCursorReady = false;
-
     /** @var array{x: float, y: float}|null */
     private ?array $viewportChromeOffset = null;
 
     private function bootstrapDomains(): void
     {
+        $this->applyUserAgent();
         $this->cdp('Page.enable');
+        $this->applyFingerprint();
         $this->cdp('Page.setLifecycleEventsEnabled', ['enabled' => true]);
         $this->cdp('Runtime.enable');
         $this->runtimeEnabled = true;
+    }
+
+    private function applyUserAgent(): void
+    {
+        $this->applyUserAgentToAllTabs();
+    }
+
+    private function resolveUserAgent(): string
+    {
+        if ($this->userAgent !== null) {
+            return $this->userAgent;
+        }
+
+        $info = $this->endpoint->version();
+        $default = (string) ($info['User-Agent'] ?? '');
+
+        $this->userAgent = $default !== ''
+            ? str_replace(
+                'Mozilla/5.0 (X11; Linux x86_64)',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                $default,
+            )
+            : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
+
+        return $this->userAgent;
+    }
+
+    private function applyUserAgentToAllTabs(): void
+    {
+        $userAgent = $this->resolveUserAgent();
+
+        foreach ($this->endpoint->getTabs() as $tab) {
+            if (!$this->isPageTab($tab)) {
+                continue;
+            }
+
+            if (($tab['id'] ?? null) === $this->targetId && $this->client !== null) {
+                $this->cdp('Network.enable');
+                $this->cdp('Network.setUserAgentOverride', ['userAgent' => $userAgent]);
+                continue;
+            }
+
+            $client = AsyncClient::connect((string) $tab['webSocketDebuggerUrl']);
+
+            try {
+                $client->send('Network.enable');
+                $client->send('Network.setUserAgentOverride', ['userAgent' => $userAgent]);
+            } finally {
+                $client->close();
+            }
+        }
+    }
+
+    /** @param array<string, mixed> $tab */
+    private function isPageTab(array $tab): bool
+    {
+        return ($tab['type'] ?? 'page') === 'page' && !empty($tab['webSocketDebuggerUrl']);
+    }
+
+    private function applyFingerprint(): void
+    {
+        $this->applyFingerprintToAllTabs();
+    }
+
+    private function applyFingerprintToAllTabs(): void
+    {
+        $params = [
+            'source'         => Fingerprint::evaluateOnNewDocumentScript(),
+            'runImmediately' => true,
+        ];
+
+        foreach ($this->endpoint->getTabs() as $tab) {
+            $tabId = (string) ($tab['id'] ?? '');
+
+            if ($tabId === '' || !$this->isPageTab($tab) || isset($this->fingerprintAppliedTabIds[$tabId])) {
+                continue;
+            }
+
+            if ($tabId === $this->targetId && $this->client !== null) {
+                $this->cdp('Page.addScriptToEvaluateOnNewDocument', $params);
+            } else {
+                $client = AsyncClient::connect((string) $tab['webSocketDebuggerUrl']);
+
+                try {
+                    $client->send('Page.addScriptToEvaluateOnNewDocument', $params);
+                } finally {
+                    $client->close();
+                }
+            }
+
+            $this->fingerprintAppliedTabIds[$tabId] = true;
+        }
     }
 
     private function assertLaunched(): void
@@ -411,44 +514,37 @@ final class Stealth
         }
     }
 
-    private function syncCursor(float $x, float $y, bool $paintDom = true): void
+    private function animateClick(float $x, float $y): void
     {
-        if ($paintDom) {
-            $this->ensurePageCursor();
-
-            try {
-                $this->evaluate(PageCursor::move($x, $y));
-            } catch (StealthException) {
-            }
-        }
-
-        if ($this->targetId === null) {
+        if ($this->cursorSync === null || $this->targetId === null) {
             return;
         }
 
         $offset = $this->viewportChromeOffset();
-        $this->cursorSync?->move(
+        $this->cursorSync->click(
             $this->targetId,
             $x + $offset['x'],
             $y + $offset['y'],
         );
     }
 
-    private function resetPageCursor(): void
+    private function syncCursor(float $x, float $y): void
     {
-        $this->pageCursorReady = false;
-        $this->viewportChromeOffset = null;
-    }
-
-    private function ensurePageCursor(): void
-    {
-        if ($this->pageCursorReady) {
+        if ($this->cursorSync === null || $this->targetId === null) {
             return;
         }
 
-        $this->ensureRuntimeEnabled();
-        $this->evaluate(PageCursor::bootstrap());
-        $this->pageCursorReady = true;
+        $offset = $this->viewportChromeOffset();
+        $this->cursorSync->move(
+            $this->targetId,
+            $x + $offset['x'],
+            $y + $offset['y'],
+        );
+    }
+
+    private function resetViewportOffset(): void
+    {
+        $this->viewportChromeOffset = null;
     }
 
     /** @return array{x: float, y: float} */
@@ -492,8 +588,9 @@ final class Stealth
             $this->client->pump();
 
             if ($this->pageLoadState['load']) {
-                $this->resetPageCursor();
-                $this->ensurePageCursor();
+                $this->resetViewportOffset();
+                $this->applyUserAgentToAllTabs();
+                $this->applyFingerprintToAllTabs();
 
                 return;
             }
@@ -502,8 +599,9 @@ final class Stealth
         }
 
         if ($this->pageLoadState['dom']) {
-            $this->resetPageCursor();
-            $this->ensurePageCursor();
+            $this->resetViewportOffset();
+            $this->applyUserAgentToAllTabs();
+            $this->applyFingerprintToAllTabs();
 
             return;
         }
@@ -584,7 +682,7 @@ final class Stealth
 
     private function cdpFlush(): void
     {
-        $this->client?->flush(2.0);
+        $this->client?->flush();
     }
 
     private function cdp(string $method, array $params = [], ?int $timeoutSeconds = null): array

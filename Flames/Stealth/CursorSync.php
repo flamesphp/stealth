@@ -66,6 +66,15 @@ final class CursorSync
         ]);
     }
 
+    public function click(string $targetId, float $x, float $y): void
+    {
+        $this->post('/click', [
+            'targetId' => $targetId,
+            'x'        => $x,
+            'y'        => $y,
+        ]);
+    }
+
     public function focus(string $targetId): void
     {
         $this->post('/focus', ['targetId' => $targetId]);
@@ -82,7 +91,7 @@ final class CursorSync
                 'method'        => 'POST',
                 'header'        => "Content-Type: application/json\r\nConnection: close\r\n",
                 'content'       => $body,
-                'timeout'       => 1,
+                'timeout'       => 2,
                 'ignore_errors' => true,
             ],
         ]);

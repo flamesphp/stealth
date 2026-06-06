@@ -39,9 +39,9 @@ final class AsyncClient
         $this->bus->once($method, $handler);
     }
 
-    public function pump(): void
+    public function pump(): bool
     {
-        $this->bus->pump();
+        return $this->bus->pump();
     }
 
     /** @param array<string, mixed> $params */
@@ -51,12 +51,23 @@ final class AsyncClient
         $this->socket->send($this->encode($id, $method, $params));
     }
 
-    public function flush(float $timeoutSeconds = 2.0): void
+    public function flush(float $maxSeconds = 0.25): void
     {
-        $deadline = microtime(true) + $timeoutSeconds;
+        $deadline = microtime(true) + $maxSeconds;
+        $idleRounds = 0;
 
         while (microtime(true) < $deadline) {
-            $this->bus->pump();
+            if ($this->bus->pump()) {
+                $idleRounds = 0;
+                continue;
+            }
+
+            $idleRounds++;
+
+            if ($idleRounds >= 3) {
+                break;
+            }
+
             asleep(0.001);
         }
     }
