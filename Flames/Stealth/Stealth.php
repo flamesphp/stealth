@@ -139,6 +139,69 @@ final class Stealth
     }
 
     /**
+     * Clears the browser HTTP cache.
+     */
+    public function cleanCache(): void
+    {
+        $this->assertLaunched();
+        $this->ensureNetworkEnabled();
+        $this->cdp('Network.clearBrowserCache');
+    }
+
+    /**
+     * Clears all browser cookies.
+     */
+    public function cleanCookies(): void
+    {
+        $this->assertLaunched();
+        $this->ensureNetworkEnabled();
+        $this->cdp('Network.clearBrowserCookies');
+    }
+
+    /**
+     * Clears cookies for a host pattern.
+     *
+     * Examples:
+     *   cleanCookiesByHost('google.com')      — only google.com
+     *   cleanCookiesByHost('*.google.com')    — google.com and all subdomains
+     */
+    public function cleanCookiesByHost(string $host): void
+    {
+        $this->assertLaunched();
+        $this->ensureNetworkEnabled();
+
+        $cookies = $this->cdp('Network.getAllCookies')['cookies'] ?? [];
+
+        if (!is_array($cookies)) {
+            return;
+        }
+
+        foreach ($cookies as $cookie) {
+            if (!is_array($cookie)) {
+                continue;
+            }
+
+            $domain = (string) ($cookie['domain'] ?? '');
+
+            if ($domain === '' || !CookieHostMatcher::matches($domain, $host)) {
+                continue;
+            }
+
+            $name = (string) ($cookie['name'] ?? '');
+
+            if ($name === '') {
+                continue;
+            }
+
+            $this->cdp('Network.deleteCookies', [
+                'name'   => $name,
+                'domain' => $domain,
+                'path'   => (string) ($cookie['path'] ?? '/'),
+            ]);
+        }
+    }
+
+    /**
      * Evaluates a JavaScript expression and returns its value.
      */
     public function evaluate(string $expression, bool $awaitPromise = false): mixed
@@ -177,7 +240,7 @@ final class Stealth
         }
     }
 
-    public function querySelector(string $selector, ?int $timeoutSeconds = null): Element|false
+    public function query(string $selector, ?int $timeoutSeconds = null): Element|false
     {
         if (!$this->hasSelector($selector, $timeoutSeconds)) {
             return false;
@@ -194,7 +257,7 @@ final class Stealth
 
     public function click(string $selector, ?int $timeoutSeconds = null): void
     {
-        $element = $this->querySelector($selector, $timeoutSeconds);
+        $element = $this->query($selector, $timeoutSeconds);
 
         if ($element === false) {
             throw new StealthException("Element not found: {$selector}");
@@ -383,6 +446,8 @@ final class Stealth
     // ── Internals ────────────────────────────────────────────────────────────
 
     private bool $runtimeEnabled = false;
+
+    private bool $networkEnabled = false;
 
     private bool $domEnabled = false;
 
@@ -619,6 +684,16 @@ final class Stealth
         $this->runtimeEnabled = true;
     }
 
+    private function ensureNetworkEnabled(): void
+    {
+        if ($this->networkEnabled) {
+            return;
+        }
+
+        $this->cdp('Network.enable');
+        $this->networkEnabled = true;
+    }
+
     private function ensureDomEnabled(): void
     {
         if ($this->domEnabled) {
@@ -640,14 +715,172 @@ final class Stealth
             return null;
         }
 
+        return $this->domQuery($rootId, $selector);
+    }
+
+    /** @internal */
+    public function domQuery(int $parentNodeId, string $selector): ?int
+    {
+        $this->ensureDomEnabled();
+
         $query = $this->cdp('DOM.querySelector', [
-            'nodeId'   => $rootId,
+            'nodeId'   => $parentNodeId,
             'selector' => $selector,
         ]);
 
         $nodeId = (int) ($query['nodeId'] ?? 0);
 
         return $nodeId > 0 ? $nodeId : null;
+    }
+
+    /** @return list<int> */
+    public function domQueryAll(int $parentNodeId, string $selector): array
+    {
+        $arrayObjectId = $this->domCall(
+            $parentNodeId,
+            'function (selector) { return Array.from(this.querySelectorAll(selector)); }',
+            [$selector],
+            returnObject: true,
+        );
+
+        if (!is_string($arrayObjectId) || $arrayObjectId === '') {
+            return [];
+        }
+
+        $properties = $this->cdp('Runtime.getProperties', [
+            'objectId'      => $arrayObjectId,
+            'ownProperties' => true,
+        ]);
+
+        $nodeIds = [];
+
+        foreach ($properties['result'] ?? [] as $property) {
+            if (!is_array($property)) {
+                continue;
+            }
+
+            $value = $property['value'] ?? null;
+
+            if (!is_array($value) || ($value['subtype'] ?? '') !== 'node') {
+                continue;
+            }
+
+            $objectId = (string) ($value['objectId'] ?? '');
+
+            if ($objectId === '') {
+                continue;
+            }
+
+            $nodeId = $this->domNodeId($objectId);
+
+            if ($nodeId > 0) {
+                $nodeIds[] = $nodeId;
+            }
+        }
+
+        return $nodeIds;
+    }
+
+    public function domObjectId(int $nodeId): string
+    {
+        $this->ensureDomEnabled();
+
+        $result = $this->cdp('DOM.resolveNode', ['nodeId' => $nodeId]);
+        $objectId = (string) ($result['object']['objectId'] ?? '');
+
+        if ($objectId === '') {
+            throw new StealthException("Could not resolve DOM node {$nodeId}.");
+        }
+
+        return $objectId;
+    }
+
+    public function domNodeId(string $objectId): int
+    {
+        $this->ensureDomEnabled();
+
+        try {
+            $result = $this->cdp('DOM.requestNode', ['objectId' => $objectId]);
+        } catch (StealthException) {
+            return 0;
+        }
+
+        return (int) ($result['nodeId'] ?? 0);
+    }
+
+    public function domParentId(int $nodeId): ?int
+    {
+        $this->ensureDomEnabled();
+
+        $result = $this->cdp('DOM.describeNode', ['nodeId' => $nodeId]);
+        $parentId = (int) ($result['node']['parentId'] ?? 0);
+
+        return $parentId > 0 ? $parentId : null;
+    }
+
+    public function domTag(int $nodeId): string
+    {
+        $this->ensureDomEnabled();
+
+        $result = $this->cdp('DOM.describeNode', ['nodeId' => $nodeId]);
+
+        return strtolower((string) ($result['node']['localName'] ?? ''));
+    }
+
+    /**
+     * @param list<mixed> $arguments
+     */
+    public function domCall(
+        int $nodeId,
+        string $functionDeclaration,
+        array $arguments = [],
+        bool $returnObject = false,
+    ): mixed {
+        return $this->domCallObject($this->domObjectId($nodeId), $functionDeclaration, $arguments, $returnObject);
+    }
+
+    /**
+     * @param list<mixed> $arguments
+     */
+    public function domCallObject(
+        string $objectId,
+        string $functionDeclaration,
+        array $arguments = [],
+        bool $returnObject = false,
+    ): mixed {
+        $this->ensureRuntimeEnabled();
+
+        $result = $this->cdp('Runtime.callFunctionOn', [
+            'objectId'            => $objectId,
+            'functionDeclaration' => $functionDeclaration,
+            'arguments'           => array_map(
+                static fn (mixed $value): array => ['value' => $value],
+                $arguments,
+            ),
+            'returnByValue'       => !$returnObject,
+            'awaitPromise'        => false,
+        ]);
+
+        if (isset($result['exceptionDetails'])) {
+            throw new StealthException(
+                (string) ($result['exceptionDetails']['text'] ?? 'DOM call failed'),
+            );
+        }
+
+        if ($returnObject) {
+            $value = $result['result'] ?? [];
+            $type = (string) ($value['type'] ?? '');
+
+            if ($type === 'undefined' || ($type === 'object' && ($value['subtype'] ?? '') === 'null')) {
+                return null;
+            }
+
+            $objectId = (string) ($value['objectId'] ?? '');
+
+            return $objectId !== '' ? $objectId : null;
+        }
+
+        return $result['result']['value'] ?? null;
     }
 
     /** @return array<string, mixed> */
