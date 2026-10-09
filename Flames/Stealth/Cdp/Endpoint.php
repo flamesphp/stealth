@@ -11,27 +11,27 @@ use Flames\Stealth\Exception\StealthException;
 /**
  * @internal
  */
-final class Endpoint
+final readonly class Endpoint
 {
-    public const MIN_CHROME_MAJOR = 148;
+    public const int MIN_CHROME_MAJOR = 148;
 
-    public const DEFAULT_TIMEOUT = 10;
+    public const int DEFAULT_TIMEOUT = 10;
 
-    private const HTTP_TIMEOUT = 2;
+    private const int HTTP_TIMEOUT = 2;
 
-    private const CONNECT_TIMEOUT = 1.0;
+    private const float CONNECT_TIMEOUT = 1.0;
 
-    private const TARGET_LIST_TIMEOUT = 2;
+    private const int TARGET_LIST_TIMEOUT = 2;
 
-    private const LAUNCH_CDP_TIMEOUT = 8;
+    private const int LAUNCH_CDP_TIMEOUT = 8;
 
-    private const MAX_ATTEMPTS = 3;
+    private const int MAX_ATTEMPTS = 3;
 
-    private const RETRY_DELAY = 0.2;
+    private const float RETRY_DELAY = 0.2;
 
     public function __construct(
-        private readonly string $host,
-        private readonly int $port,
+        private string $host,
+        private int $port,
     ) {}
 
     public static function resolveDefaultTimeout(): int

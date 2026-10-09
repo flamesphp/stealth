@@ -13,9 +13,9 @@ use Flames\Env\Env;
  */
 final class Fingerprint
 {
-    private const DEFAULT_WEBGL_VENDOR = 'Google Inc. (NVIDIA)';
+    private const string DEFAULT_WEBGL_VENDOR = 'Google Inc. (NVIDIA)';
 
-    private const DEFAULT_WEBGL_RENDERER = 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002487) Direct3D11 vs_5_0 ps_5_0, D3D11)';
+    private const string DEFAULT_WEBGL_RENDERER = 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002487) Direct3D11 vs_5_0 ps_5_0, D3D11)';
 
     public static function webglVendor(): string
     {

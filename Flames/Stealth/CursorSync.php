@@ -12,9 +12,9 @@ use Flames\Env\Env;
  *
  * @internal
  */
-final class CursorSync
+final readonly class CursorSync
 {
-    private readonly string $baseUrl;
+    private string $baseUrl;
 
     public function __construct(?string $host = null, ?int $port = null)
     {

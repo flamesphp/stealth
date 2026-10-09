@@ -12,7 +12,7 @@ namespace Flames\Stealth;
  */
 final class ProfileStorage
 {
-    public const CONTAINER_PATH = '/var/lib/flames-chromium';
+    public const string CONTAINER_PATH = '/var/lib/flames-chromium';
 
-    public const VOLUME_NAME = 'stealth-chromium-profile';
+    public const string VOLUME_NAME = 'stealth-chromium-profile';
 }

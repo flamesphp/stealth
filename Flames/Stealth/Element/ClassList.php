@@ -10,10 +10,10 @@ use Flames\Stealth\Element;
 /**
  * @property-read Arr<int, string> $all
  */
-final class ClassList
+final readonly class ClassList
 {
     public function __construct(
-        private readonly Element $element,
+        private Element $element,
     ) {}
 
     public function add(string $class): void

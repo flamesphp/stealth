@@ -6,10 +6,10 @@ namespace Flames\Stealth\Element;
 
 use Flames\Stealth\Element;
 
-final class Attribute
+final readonly class Attribute
 {
     public function __construct(
-        private readonly Element $element,
+        private Element $element,
     ) {}
 
     public function get(string $attr): ?string

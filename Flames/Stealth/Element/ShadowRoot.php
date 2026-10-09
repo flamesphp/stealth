@@ -6,11 +6,11 @@ namespace Flames\Stealth\Element;
 
 use Flames\Stealth\Element;
 
-final class ShadowRoot
+final readonly class ShadowRoot
 {
     public function __construct(
-        private readonly Element $host,
-        private readonly string $objectId,
+        private Element $host,
+        private string $objectId,
     ) {}
 
     public function query(string $selector): Element|false
